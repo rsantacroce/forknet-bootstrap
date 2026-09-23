@@ -1,0 +1,43 @@
+[Unit]
+Description=Thunder sidechain node (@@PROFILE@@ forknet, sidechain #@@SIDECHAIN_ID@@)
+After=network-online.target @@ENFORCER_UNIT@@.service
+Wants=network-online.target
+Wants=@@ENFORCER_UNIT@@.service
+
+[Service]
+Type=simple
+User=@@FORKNET_USER@@
+Group=@@FORKNET_USER@@
+WorkingDirectory=@@HOME_DIR@@
+
+# --network forknet is the setting people get wrong. The magic bytes are
+# 85 18 95 XX, where XX is 00 regtest / 01 signet / 02 forknet. Pointed at a
+# forknet peer while running signet, the node logs
+#   received incorrect magic: 85189501
+# and never syncs — which reads like a peering or version problem rather than
+# a one-word config error.
+#
+# `forknet` names the SIDECHAIN network, not the mainchain fork underneath it.
+# Two different forknets both running Thunder on `forknet` share magic and will
+# try to peer with each other; --network-magic (emitted below when the profile
+# sets THUNDER_NETWORK_MAGIC) is what separates them.
+#
+# --net-addr binds QUIC over UDP. It will not appear in `ss -tln`; use `ss -uln`.
+ExecStart=@@SW_DIR@@/thunder-rust/target/release/thunder_app \
+  --headless \
+  --datadir @@THUNDER_DATADIR@@ \
+  --network @@THUNDER_NETWORK@@ \
+@@THUNDER_NETWORK_MAGIC_LINE@@
+  --mainchain-grpc-url http://@@ENFORCER_GRPC@@ \
+  --net-addr 0.0.0.0:@@THUNDER_P2P_PORT@@ \
+  --rpc-addr 127.0.0.1:@@THUNDER_RPC_PORT@@ \
+  --log-level INFO
+
+Restart=always
+RestartSec=15
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

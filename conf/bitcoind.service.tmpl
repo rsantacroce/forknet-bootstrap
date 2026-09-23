@@ -1,0 +1,27 @@
+[Unit]
+Description=Bitcoin Core (@@BITCOIN_REF@@) — @@PROFILE@@ forknet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@@FORKNET_USER@@
+Group=@@FORKNET_USER@@
+ExecStart=@@SW_DIR@@/bitcoin/build/bin/bitcoind -datadir=@@BTC_DATADIR@@
+Restart=on-failure
+RestartSec=10
+
+# A clean shutdown flushes the UTXO cache. Killing bitcoind mid-flush costs
+# hours of chainstate rebuild on a datadir this size, so give it room and
+# never escalate to SIGKILL. In practice shutdown takes a few seconds; this
+# ceiling only matters when it is mid-write.
+TimeoutStopSec=900
+KillSignal=SIGTERM
+SendSIGKILL=no
+
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,58 @@
+[Unit]
+Description=BIP300/301 enforcer — @@PROFILE@@
+After=network-online.target @@BITCOIND_UNIT@@.service
+Wants=network-online.target
+# Requires= would propagate bitcoind's stop to this unit but does NOT make it
+# start with bitcoind. Wants= plus the ordering above is what actually gets a
+# working boot sequence.
+Wants=@@BITCOIND_UNIT@@.service
+
+[Service]
+Type=simple
+User=@@FORKNET_USER@@
+Group=@@FORKNET_USER@@
+WorkingDirectory=@@HOME_DIR@@
+
+# --network-preset is mandatory and is PER NETWORK — drynet3, drynet4,
+# alphanet are different presets, not versions of one. Without it the enforcer
+# derives parameters from the node's reported chain, which is "main" for every
+# one of these (they are all mainnet forks), and then disagrees with every peer
+# about magic bytes. Note that a preset can be REMOVED upstream: drynet3 exists
+# in v0.3.4 and not on master, which is why the profile pins a commit.
+#
+# --enable-block-template-server is what opens --serve-rpc-addr. Set the
+# address without this flag and nothing listens on it, with no error logged
+# anywhere; a pool then silently falls back to plain bitcoind templates, whose
+# coinbases carry no BIP300/301 commitments, and no sidechain can advance.
+# It also requires --enable-mempool.
+#
+# --coinbase-recipient pins the served template's reward. Left unset with a
+# wallet enabled, the enforcer uses a fresh wallet address each time, which
+# scatters rewards across addresses.
+ExecStart=@@SW_DIR@@/bip300301_enforcer/target/release/bip300301_enforcer \
+  --data-dir @@ENFORCER_DATADIR@@ \
+  --enable-wallet \
+  --enable-mempool \
+  --enable-block-template-server \
+  --wallet-auto-create \
+  --wallet-sync-source disabled \
+  --node-rpc-addr 127.0.0.1:@@BTC_RPC_PORT@@ \
+  --node-rpc-user @@RPC_USER@@ \
+  --node-rpc-pass @@RPC_PASS@@ \
+  --node-zmq-addr-sequence @@ZMQ_ADDR@@ \
+@@COINBASE_RECIPIENT_LINE@@
+@@ENFORCER_NETWORK_MAGIC_LINE@@
+  --network-preset @@ENFORCER_NETWORK_PRESET@@ \
+  --bitcoin-core-skip-version-check \
+  --serve-rpc-addr @@ENFORCER_GBT@@ \
+  --serve-grpc-addr @@ENFORCER_GRPC@@ \
+  --log-level INFO
+
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

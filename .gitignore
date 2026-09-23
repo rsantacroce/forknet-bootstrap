@@ -1,0 +1,16 @@
+.DS_Store
+bootstrap.env
+rendered-*/
+
+# Wallet + backup artifacts. Nothing here should ever reach the repo: the
+# enforcer seed and the Thunder mnemonic cannot be regenerated, and a commit is
+# forever even after a delete. Backups live in ~/secure-backups/<host>/ (0700),
+# outside any git working tree.
+*.tar.gz
+seed.json
+*.mdb
+*mnemonic*
+*credentials*
+rpcauth.conf
+admin.cred
+install.env

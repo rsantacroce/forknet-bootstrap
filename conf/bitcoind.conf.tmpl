@@ -1,0 +1,118 @@
+# bitcoind configuration — profile @@PROFILE@@ (@@BTC_NETWORK_MAGIC@@)
+#
+# FILENAME MATTERS, AND IT IS NOT THE SAME ON EVERY FORK. This file is
+# installed as @@BTC_CONF_NAME@@ because that is the name compiled into the
+# branch being built:
+#
+#   ecash-com/bitcoin  drynet3           drivechain-ecash.conf
+#   ecash-com/bitcoin  alphanet-bridge   ecash.conf
+#   ecash-com/bitcoin  betanet-bridge    ecash.conf
+#   L2L/bitcoin-patched forknet-31       drivechain-forknet.conf
+#
+# A file under any other name is read by nothing, and the daemon comes up on
+# stock defaults — which looks like a broken node, not a misnamed file.
+
+# Comments stay on their own lines. Whether this parser strips a trailing
+# `key=value # comment` is not worth depending on: if it does not, the value
+# silently becomes something else.
+server=1
+listen=1
+
+# systemd owns the lifecycle; forking would break Type=simple.
+daemon=0
+
+# The enforcer probes the REST interface at startup.
+rest=1
+
+fallbackfee=0.0001
+
+# --- RPC -------------------------------------------------------------------
+rpcport=@@BTC_RPC_PORT@@
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+
+# Credentials live in their own file so the hash is not tangled up with the
+# settings you actually edit. includeconf resolves RELATIVE TO THE DATADIR, so
+# this must stay a bare filename — an absolute path is rejected.
+#
+# rpcauth is mutually exclusive with rpcuser/rpcpassword. Setting both makes
+# bitcoind refuse to start.
+includeconf=rpcauth.conf
+
+# --- ZMQ -------------------------------------------------------------------
+# The enforcer subscribes to `sequence` for mempool tracking. Without it, it
+# starts but never sees unconfirmed transactions.
+zmqpubrawblock=@@ZMQ_ADDR@@
+zmqpubsequence=@@ZMQ_ADDR@@
+
+# HIGH-WATER MARK, AND THE DEFAULT IS TOO LOW TO SURVIVE AN IBD.
+#
+# bitcoind's ZMQ publisher queues at most 1000 messages per topic by default
+# and DROPS the rest — it never blocks. The enforcer tracks the mempool from
+# `sequence` and treats a gap as fatal to its initial sync:
+#
+#   ERROR mempool initial sync error: Missing message with zmq sequence 367465
+#   WARN  mempool sync task w/block producer failed recoverably, re-syncing
+#
+# "Recoverably" means it starts the whole initial sync again, wallet rescan
+# included. During a fast sync bitcoind publishes far faster than the enforcer
+# drains, so the queue overruns, and the retry is no more likely to finish
+# than the attempt before it. Observed on betanet 2026-09-17: the validator
+# sat pinned at 910,539 for over an hour while bitcoind was at 967,355, with
+# the wallet walking 738k->910k over and over and the getblocktemplate server
+# answering "enforcer is still syncing" the entire time. Nothing crashes and
+# nothing logs a stall — the pool simply never starts.
+#
+# These are cheap: the queue is bounded memory the publisher only uses when
+# the subscriber is behind.
+zmqpubsequencehwm=100000
+zmqpubrawblockhwm=10000
+
+# --- network ---------------------------------------------------------------
+port=@@BTC_P2P_PORT@@
+
+# Networks with no DNS seed of their own need a peer handed to them; the ones
+# that ship seeds do not, and this line is omitted entirely when the profile
+# leaves BTC_ADDNODE empty.
+@@BTC_ADDNODE_LINE@@
+
+# Required by the enforcer to look up historical transactions. Turning it on
+# after the fact forces a full reindex, so set it before the first sync.
+txindex=1
+
+# Every profile here forks mainnet at a height whose timestamps look ancient
+# relative to a fresh node's clock. Without this, bitcoind decides it is not
+# synced, refuses to serve getblocktemplate, and mining never starts.
+maxtipage=2147483647
+
+dbcache=@@DBCACHE_MB@@
+
+# Signature checking below this block is skipped. The hash must come from a
+# node you control: it is a statement that you have already validated that
+# chain yourself. Omitted entirely when unset.
+@@BTC_ASSUMEVALID_LINE@@
+
+# REQUIRED, and it looks like the opposite of what you want.
+#
+# ecash-com/bitcoin @ alphanet-bridge and @ betanet-bridge both DISABLE
+# getblocktemplate by default:
+#
+#   "getblocktemplate is disabled: only block templates produced by
+#    bip300301_enforcer are safe to mine on. To override for testing,
+#    restart with -deprecatedrpc=getblocktemplate."
+#
+# That guard is aimed at miners pointing a pool straight at bitcoind, whose
+# coinbases carry no BIP300/301 commitments (trap 7). But the ENFORCER itself
+# calls getblocktemplate to get the base template it then adds those
+# commitments to — so with this unset the enforcer cannot start at all. It
+# exits 1 with "failed to get sample block template" and systemd restarts it
+# forever.
+#
+# The failure only appears once bitcoind LEAVES IBD: before that the enforcer
+# never reaches the template call, so a node can look healthy for a whole
+# initial sync and then crash-loop the moment it finishes.
+#
+# Safe here because the RPC port is bound to 127.0.0.1 and the pool is pointed
+# at the enforcer's template server, which lib/pool.sh refuses to let you
+# change to bitcoind's port.
+deprecatedrpc=getblocktemplate

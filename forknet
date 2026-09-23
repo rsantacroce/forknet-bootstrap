@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# forknet — control the node stack on this box.
+#
+# The stack must start bitcoind -> enforcer -> thunder -> pool and stop in
+# reverse: the enforcer needs bitcoind's RPC and ZMQ at startup, Thunder needs
+# the enforcer's gRPC, and the pool needs the enforcer's block template server.
+# systemd's Wants= does not enforce ordering on its own, so this wrapper does.
+#
+# Paths, ports and unit names come from /etc/forknet/env, written by
+# `forknet-bootstrap.sh configure`. Without it this wrapper would have to guess
+# the profile, and would report on the wrong datadir whenever it guessed wrong.
+set -uo pipefail
+
+# shellcheck disable=SC1091
+[ -f /etc/forknet/env ] && . /etc/forknet/env
+
+PROFILE=${PROFILE:-drynet3}
+FORKNET_USER=${FORKNET_USER:-forknet}
+HOME_DIR=${HOME_DIR:-/home/$FORKNET_USER}
+SW=${SW_DIR:-$HOME_DIR/forknet-software}
+BTC_DATADIR=${BTC_DATADIR:-$HOME_DIR/$PROFILE}
+THUNDER_RPC_PORT=${THUNDER_RPC_PORT:-6009}
+THUNDER_P2P_PORT=${THUNDER_P2P_PORT:-4009}
+ENFORCER_GBT=${ENFORCER_GBT:-127.0.0.1:8122}
+POOL_ROOT=${POOL_ROOT:-$SW/simplepool}
+
+BITCOIND_UNIT=${BITCOIND_UNIT:-bitcoind}
+ENFORCER_UNIT=${ENFORCER_UNIT:-bip300301-enforcer}
+THUNDER_UNIT=${THUNDER_UNIT:-thunder}
+POOL_UNIT=${POOL_UNIT:-simplepool}
+DASH_UNIT=${DASH_UNIT:-simplepool-dashboard}
+PAYOUT_UNIT=${PAYOUT_UNIT:-simplepool-payout}
+
+ORDER=("$BITCOIND_UNIT" "$ENFORCER_UNIT" "$THUNDER_UNIT" "$POOL_UNIT" "$DASH_UNIT" "$PAYOUT_UNIT")
+BTC_CLI="$SW/bitcoin/build/bin/bitcoin-cli"
+THU_CLI="$SW/thunder-rust/target/release/thunder_app_cli"
+
+svc() {
+  case "$1" in
+    btc|bitcoind)  echo "$BITCOIND_UNIT" ;;
+    enf|enforcer)  echo "$ENFORCER_UNIT" ;;
+    thu|thunder)   echo "$THUNDER_UNIT" ;;
+    pool)          echo "$POOL_UNIT" ;;
+    dash|dashboard) echo "$DASH_UNIT" ;;
+    payout)        echo "$PAYOUT_UNIT" ;;
+    *) echo "unknown service: $1" >&2; return 1 ;;
+  esac
+}
+
+repo() {
+  case "$1" in
+    enf|enforcer) echo bip300301_enforcer ;;
+    thu|thunder)  echo thunder-rust ;;
+    *) echo "unknown repo: $1" >&2; return 1 ;;
+  esac
+}
+
+installed() { [ -f "/etc/systemd/system/$1.service" ]; }
+
+build_rust() {
+  local r u dir before after
+  r=$(repo "$1") || return 1
+  u=$(svc  "$1") || return 1
+  dir="$SW/$r"
+
+  echo "=== $r: fetching ==="
+  # git as the owning user throughout: git >= 2.35.2 refuses to operate on a
+  # repo owned by somebody else ("dubious ownership"), and root reading a
+  # forknet-owned checkout is exactly that case.
+  before=$(sudo -u "$FORKNET_USER" git -C "$dir" rev-parse HEAD)
+  sudo -u "$FORKNET_USER" git -C "$dir" pull --ff-only || { echo "pull failed (local changes?)"; return 1; }
+  # Submodules before the build: a stale submodule fails deep in the compile
+  # with an error that does not mention submodules.
+  sudo -u "$FORKNET_USER" git -C "$dir" submodule update --init --recursive || return 1
+  after=$(sudo -u "$FORKNET_USER" git -C "$dir" rev-parse HEAD)
+
+  if [ "$before" = "$after" ] && [ "${FORCE:-0}" != 1 ]; then
+    echo "already up to date at ${after:0:9} — nothing to build (FORCE=1 to rebuild)"
+    return 0
+  fi
+  echo "=== $r: ${before:0:9} -> ${after:0:9}, building (several minutes) ==="
+  sudo -u "$FORKNET_USER" -H bash -lc "cd '$dir' && cargo build --release" || return 1
+
+  echo "=== $r: restarting $u ==="
+  systemctl restart "$u"; sleep 5; systemctl is-active "$u"
+}
+
+case "${1:-help}" in
+  start)
+    if [ $# -gt 1 ]; then systemctl start "$(svc "$2")"
+    else for s in "${ORDER[@]}"; do installed "$s" || continue; echo "starting $s"; systemctl start "$s"; sleep 3; done; fi ;;
+  stop)
+    if [ $# -gt 1 ]; then systemctl stop "$(svc "$2")"
+    else for ((i=${#ORDER[@]}-1;i>=0;i--)); do installed "${ORDER[$i]}" || continue; echo "stopping ${ORDER[$i]}"; systemctl stop "${ORDER[$i]}"; done; fi ;;
+  restart)
+    if [ $# -gt 1 ]; then systemctl restart "$(svc "$2")"
+    else "$0" stop; sleep 2; "$0" start; fi ;;
+  status)
+    echo "profile: $PROFILE   datadir: $BTC_DATADIR"
+    for s in "${ORDER[@]}"; do
+      installed "$s" || continue
+      printf '%-28s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"
+    done
+    echo
+    printf 'bitcoind height : '; sudo -u "$FORKNET_USER" "$BTC_CLI" -datadir="$BTC_DATADIR" getblockcount 2>/dev/null || echo down
+    printf 'thunder height  : '; sudo -u "$FORKNET_USER" "$THU_CLI" --rpc-url "http://127.0.0.1:$THUNDER_RPC_PORT" get-blockcount 2>/dev/null || echo down
+    printf 'thunder peers   : '; sudo -u "$FORKNET_USER" "$THU_CLI" --rpc-url "http://127.0.0.1:$THUNDER_RPC_PORT" list-peers 2>/dev/null || echo down
+    # QUIC over UDP — `ss -tln` will never show it, which reads as "down".
+    printf 'thunder p2p     : '; ss -uln | grep -qE "[:.]$THUNDER_P2P_PORT\b" && echo "udp $THUNDER_P2P_PORT bound" || echo "udp $THUNDER_P2P_PORT NOT bound"
+    printf 'gbt (enforcer)  : '; ss -tln | grep -qE "[:.]${ENFORCER_GBT##*:}\b" && echo "listening on $ENFORCER_GBT" || echo 'not listening'
+    ;;
+  logs)
+    [ $# -gt 1 ] || { echo "usage: forknet logs <service> [-f]" >&2; exit 1; }
+    u=$(svc "$2") || exit 1; shift 2
+    # -a is required: the enforcer log contains binary bytes, and without it
+    # grep stops printing at the first one and the tail looks truncated.
+    journalctl -u "$u" -n 100 --no-pager -a "$@" ;;
+  follow)
+    [ $# -gt 1 ] || { echo "usage: forknet follow <service>" >&2; exit 1; }
+    journalctl -u "$(svc "$2")" -n 50 -a -f ;;
+  update)
+    case "${2:-all}" in
+      all) build_rust enforcer && build_rust thunder ;;
+      enf|enforcer|thu|thunder) build_rust "$2" ;;
+      *) echo "usage: forknet update [all|enforcer|thunder]" >&2; exit 1 ;;
+    esac ;;
+  *)
+    cat <<EOF
+forknet — node stack control (profile: $PROFILE)
+
+  forknet start|stop|restart [service]   no service = whole stack, correct order
+  forknet status                         units + heights + peers + gbt port
+  forknet logs <service> [-f]            last 100 lines
+  forknet follow <service>               tail -f
+  forknet update [all|enforcer|thunder]  git pull + submodules + build + restart
+
+services: bitcoind|btc  enforcer|enf  thunder|thu  pool  dashboard|dash  payout
+env:      FORCE=1 forknet update thunder    # rebuild even if git is unchanged
+
+bitcoind is NOT updated by this wrapper — a rebuild there can force a reindex,
+so do it deliberately: forknet-bootstrap.sh bitcoin build.
+
+The pool is upgraded by re-running its own installer, which is what
+forknet-bootstrap.sh pool install does.
+EOF
+    ;;
+esac
